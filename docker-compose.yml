@@ -1,0 +1,98 @@
+name: wandersync
+
+# Shared image for Prefect server, Dask scheduler/workers and the flow runner
+x-pipeline: &pipeline
+  build: ./pipeline
+  image: wandersync/pipeline:local
+  restart: unless-stopped
+
+x-pipeline-env: &pipeline-env
+  PREFECT_API_URL: http://prefect-server:4200/api
+  DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL (Supabase session pooler URI) in .env}
+  MOCK_PROVIDER_URL: http://mock-provider:8000
+  HTTP_TIMEOUT_SECONDS: "5"
+
+services:
+  # Fake Kayak / Booking / Rentalcars website, with injected failures
+  mock-provider:
+    build: ./mock-provider
+    image: wandersync/mock-provider:local
+    restart: unless-stopped
+    environment:
+      FAIL_RATE: ${MOCK_FAIL_RATE:-0.15}
+      SLOW_RATE: ${MOCK_SLOW_RATE:-0.05}
+      PRICE_BUCKET_SECONDS: ${MOCK_PRICE_BUCKET_SECONDS:-300}
+    ports:
+      - "8090:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Prefect UI + API -> http://localhost:4200
+  prefect-server:
+    <<: *pipeline
+    command: prefect server start --host 0.0.0.0 --port 4200
+    environment:
+      PREFECT_HOME: /data/prefect
+      PREFECT_UI_API_URL: http://localhost:4200/api
+      PREFECT_SERVER_ANALYTICS_ENABLED: "false"
+    volumes:
+      - prefect-data:/data/prefect
+    ports:
+      - "4200:4200"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # Dask scheduler, dashboard -> http://localhost:8787
+  dask-scheduler:
+    <<: *pipeline
+    command: dask scheduler --dashboard-address :8787
+    ports:
+      - "8787:8787"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8787/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  dask-worker:
+    <<: *pipeline
+    command: dask worker tcp://dask-scheduler:8786 --nthreads 4 --memory-limit 1GiB
+    environment:
+      <<: *pipeline-env
+    depends_on:
+      dask-scheduler:
+        condition: service_healthy
+      prefect-server:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+
+  # Runs the flow once on start, then every SCRAPE_INTERVAL_SECONDS
+  pipeline:
+    <<: *pipeline
+    command: python -m flows.ingest
+    environment:
+      <<: *pipeline-env
+      DASK_SCHEDULER_ADDRESS: tcp://dask-scheduler:8786
+      SCRAPE_DAYS_AHEAD: ${SCRAPE_DAYS_AHEAD:-14}
+      SCRAPE_INTERVAL_SECONDS: ${SCRAPE_INTERVAL_SECONDS:-300}
+      SCRAPE_RUN_ON_START: "true"
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+      dask-scheduler:
+        condition: service_healthy
+      dask-worker:
+        condition: service_started
+      mock-provider:
+        condition: service_healthy
+
+volumes:
+  prefect-data:
