@@ -12,7 +12,72 @@ x-pipeline-env: &pipeline-env
   MOCK_PROVIDER_URL: http://mock-provider:8000
   HTTP_TIMEOUT_SECONDS: "5"
 
+x-service: &service
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+    interval: 10s
+    timeout: 3s
+    retries: 5
+    start_period: 10s
+
+x-service-env: &service-env
+  DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL (Supabase session pooler URI) in .env}
+  DB_POOL_MAX: "2"
+
 services:
+  # ---------------------------------------------------------------------
+  # Booking microservices. Ports are bound to 127.0.0.1 for local testing
+  # only; the GraphQL gateway will be the single public entry point.
+  # ---------------------------------------------------------------------
+  flights-service:
+    <<: *service
+    build: { context: ./services, dockerfile: flights/Dockerfile }
+    image: wandersync/flights-service:local
+    environment:
+      <<: *service-env
+    ports:
+      - "127.0.0.1:8001:8000"
+
+  hotels-service:
+    <<: *service
+    build: { context: ./services, dockerfile: hotels/Dockerfile }
+    image: wandersync/hotels-service:local
+    environment:
+      <<: *service-env
+    ports:
+      - "127.0.0.1:8002:8000"
+
+  cars-service:
+    <<: *service
+    build: { context: ./services, dockerfile: cars/Dockerfile }
+    image: wandersync/cars-service:local
+    environment:
+      <<: *service-env
+    ports:
+      - "127.0.0.1:8003:8000"
+
+  # Orders / Billing + SAGA orchestrator
+  orders-service:
+    <<: *service
+    build: { context: ./services, dockerfile: orders/Dockerfile }
+    image: wandersync/orders-service:local
+    environment:
+      <<: *service-env
+      FLIGHTS_URL: http://flights-service:8000
+      HOTELS_URL: http://hotels-service:8000
+      CARS_URL: http://cars-service:8000
+      SERVICE_TIMEOUT_SECONDS: "5"
+    ports:
+      - "127.0.0.1:8004:8000"
+    depends_on:
+      flights-service:
+        condition: service_healthy
+      hotels-service:
+        condition: service_healthy
+      cars-service:
+        condition: service_healthy
+
   # Fake Kayak / Booking / Rentalcars website, with injected failures
   mock-provider:
     build: ./mock-provider
