@@ -8,7 +8,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY cars/requirements.txt .
-RUN pip install -r requirements.txt
+# Upgrade pip first: the base image ships an older pip with known vulnerabilities
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY common ./common
 COPY cars/app ./app

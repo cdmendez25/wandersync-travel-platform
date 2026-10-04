@@ -10,7 +10,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+# Upgrade pip first: the base image ships an older pip with known vulnerabilities
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY scraping ./scraping
 COPY flows ./flows

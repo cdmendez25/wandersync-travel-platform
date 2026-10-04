@@ -27,6 +27,65 @@ x-service-env: &service-env
 
 services:
   # ---------------------------------------------------------------------
+  # Web frontend (React) -> http://localhost:3000
+  # ---------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_GRAPHQL_URL: http://localhost:8080/graphql
+    image: wandersync/frontend:local
+    restart: unless-stopped
+    ports:
+      - "3000:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    depends_on:
+      gateway:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------
+  # GraphQL API Gateway: the single public entry point -> http://localhost:8080/graphql
+  # ---------------------------------------------------------------------
+  gateway:
+    <<: *service
+    build: ./gateway
+    image: wandersync/gateway:local
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL (Supabase session pooler URI) in .env}
+      SUPABASE_URL: ${SUPABASE_URL:?Set SUPABASE_URL in .env}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY:?Set SUPABASE_SERVICE_KEY in .env}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-wandersync-dev-only}@redis:6379/0
+      ORDERS_URL: http://orders-service:8000
+      COOKIE_SECURE: "false"            # set "true" when served over HTTPS
+      FRONTEND_ORIGINS: http://localhost:5173,http://localhost:3000
+      GRAPHIQL: "true"                  # in-browser GraphQL explorer for the demo
+      ALLOW_FAILURE_SIMULATION: "true"  # demo switch for SAGA failures
+    ports:
+      - "8080:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      orders-service:
+        condition: service_healthy
+
+  # Session store + rate-limit counters (not exposed outside Docker)
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-wandersync-dev-only}", "--save", "", "--appendonly", "no"]
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-wandersync-dev-only}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------
   # Booking microservices. Ports are bound to 127.0.0.1 for local testing
   # only; the GraphQL gateway will be the single public entry point.
   # ---------------------------------------------------------------------
