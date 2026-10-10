@@ -1,4 +1,4 @@
-"""Orders / Billing service: creates orders and runs the booking SAGA."""
+"""Orders / Billing service: creates orders and triggers the booking SAGA Flow."""
 import logging
 import threading
 from contextlib import asynccontextmanager
@@ -10,7 +10,7 @@ from uuid import UUID
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, model_validator
 
-from app import saga
+from app import prefect_flow, saga
 from common.db import create_pool
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -111,7 +111,10 @@ def create_order(req: CreateOrderRequest):
             ).fetchone()
         return _order_view(existing["id"])
 
-    saga.run_saga(pool, order, req.simulate_failure)
+    try:
+        prefect_flow.run_booking_saga(str(order["id"]), req.simulate_failure)
+    except prefect_flow.SagaFlowError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return _order_view(order["id"])
 
 

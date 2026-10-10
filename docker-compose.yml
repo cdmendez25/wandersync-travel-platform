@@ -127,6 +127,9 @@ services:
       HOTELS_URL: http://hotels-service:8000
       CARS_URL: http://cars-service:8000
       SERVICE_TIMEOUT_SECONDS: "5"
+      PREFECT_API_URL: http://prefect-server:4200/api
+      SAGA_DEPLOYMENT: booking-saga/booking-saga
+      SAGA_FLOW_TIMEOUT_SECONDS: "55"
     ports:
       - "127.0.0.1:8004:8000"
     depends_on:
@@ -135,6 +138,8 @@ services:
       hotels-service:
         condition: service_healthy
       cars-service:
+        condition: service_healthy
+      saga-pipeline:
         condition: service_healthy
 
   # Fake Kayak / Booking / Rentalcars website, with injected failures
@@ -217,6 +222,32 @@ services:
       dask-worker:
         condition: service_started
       mock-provider:
+        condition: service_healthy
+
+  # Serves the deployment that orchestrates each booking SAGA in Prefect.
+  saga-pipeline:
+    <<: *pipeline
+    command: python -m flows.booking_saga
+    environment:
+      <<: *pipeline-env
+      FLIGHTS_URL: http://flights-service:8000
+      HOTELS_URL: http://hotels-service:8000
+      CARS_URL: http://cars-service:8000
+      SERVICE_TIMEOUT_SECONDS: "5"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://prefect-server:4200/api/deployments/name/booking-saga/booking-saga')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+      flights-service:
+        condition: service_healthy
+      hotels-service:
+        condition: service_healthy
+      cars-service:
         condition: service_healthy
 
 volumes:
