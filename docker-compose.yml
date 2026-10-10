@@ -129,7 +129,7 @@ services:
       SERVICE_TIMEOUT_SECONDS: "5"
       PREFECT_API_URL: http://prefect-server:4200/api
       SAGA_DEPLOYMENT: booking-saga/booking-saga
-      SAGA_FLOW_TIMEOUT_SECONDS: "55"
+      SAGA_FLOW_TIMEOUT_SECONDS: "45"  # must stay below the gateway's 60 s wait for orders-service
     ports:
       - "127.0.0.1:8004:8000"
     depends_on:
@@ -234,6 +234,7 @@ services:
       HOTELS_URL: http://hotels-service:8000
       CARS_URL: http://cars-service:8000
       SERVICE_TIMEOUT_SECONDS: "5"
+      PREFECT_RUNNER_POLL_FREQUENCY: "1"  # pick up booking runs within ~1 s (default is 10 s)
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://prefect-server:4200/api/deployments/name/booking-saga/booking-saga')"]
       interval: 5s

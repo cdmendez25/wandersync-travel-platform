@@ -30,7 +30,7 @@ WanderSync vende paquetes turísticos que combinan **vuelo + hotel + auto** en u
 
 | Problema | Consecuencia | Solución en este rediseño |
 |---|---|---|
-| **Reservas huérfanas**: el pago y el vuelo se confirmaban, pero el hotel o el auto fallaban en la red y no había reversión | Clientes cobrados por paquetes incompletos; datos inconsistentes | **Patrón SAGA orquestado** con compensaciones automáticas, idempotencia y recuperación tras caídas (§8) |
+| **Reservas huérfanas**: el pago y el vuelo se confirmaban, pero el hotel o el auto fallaban en la red y no había reversión | Clientes cobrados por paquetes incompletos; datos inconsistentes | **Patrón SAGA orquestado como flow de Prefect**, con compensaciones automáticas, idempotencia y recuperación tras caídas (§8) |
 | **Sincronización masiva de tarifas** bloqueaba la persistencia y la red | Cuellos de botella y servicios principales bloqueados | **Ingesta asíncrona y distribuida** con Dask, orquestada y observada con Prefect (§6) |
 
 Además, el sistema se diseñó con **seguridad desde el inicio** (§9): sesiones resistentes a *Session Fixation*, contraseñas con Argon2id, *rate limiting* y auditoría de dependencias.
@@ -47,7 +47,7 @@ Además, el sistema se diseñó con **seguridad desde el inicio** (§9): sesione
 | Persistencia | **Supabase** (PostgreSQL 15 + **pg_graphql**) | Base de datos moderna con GraphQL nativo (`/graphql/v1`), exigido por el enunciado (§3.3) |
 | Sesiones / rate limiting | Redis 7 | Almacenamiento en memoria compartido por todas las réplicas del gateway; operaciones atómicas con Lua |
 | Computación distribuida | **Dask** (1 scheduler + 2 workers) | Paraleliza el scraping, la limpieza y la carga sin bloquear los servicios principales |
-| Orquestación / observabilidad | **Prefect 3** | Flujos con reintentos declarativos, programación periódica y panel visual |
+| Orquestación / observabilidad | **Prefect 3** | Orquesta la ingesta y cada reserva (SAGA): flujos con reintentos declarativos, programación periódica y panel visual |
 | Contenedores | **Docker + Docker Compose** | Todo el ecosistema se levanta con `docker compose up` |
 
 Se eligió **Python para todo el backend** porque Dask y Prefect son librerías de Python: un solo lenguaje reduce la complejidad y permite compartir patrones entre servicios.
@@ -70,7 +70,8 @@ flowchart TB
     end
 
     subgraph servicios[Microservicios de reservas]
-        orders["Orders / Facturación<br/>Orquestador SAGA · :8004"]
+        orders["Orders / Facturación<br/>órdenes y pagos · :8004"]
+        saga["saga-pipeline<br/>flow booking-saga"]
         flights["Flights · :8001"]
         hotels["Hotels · :8002"]
         cars["Cars · :8003"]
@@ -80,8 +81,12 @@ flowchart TB
         pg[("PostgreSQL + pg_graphql<br/>/graphql/v1")]
     end
 
+    subgraph orquesta[Orquestación y observabilidad]
+        prefect["Prefect Server<br/>flows: ingesta + SAGA · :4200"]
+    end
+
     subgraph ingesta[Ingesta distribuida]
-        prefect["Prefect Server + Flow<br/>:4200"]
+        pipe["pipeline<br/>flow ingest-travel-inventory"]
         sched["Dask Scheduler<br/>:8787"]
         w1["Dask Worker 1"]
         w2["Dask Worker 2"]
@@ -94,10 +99,15 @@ flowchart TB
     gw -- "catálogo: GraphQL (solo campos pedidos)" --> pg
     gw -- "usuarios: SQL (esquema private)" --> pg
     gw -- "bookPackage / pedidos: REST" --> orders
-    orders -- "reserve / cancel" --> flights & hotels & cars
-    orders -- "orders, payments, saga_steps" --> pg
+    orders -- "cotización (GET)" --> flights & hotels & cars
+    orders -- "crea la ejecución y espera el resultado" --> prefect
+    prefect -- "entrega la ejecución" --> saga
+    saga -- "reserve / cancel" --> flights & hotels & cars
+    saga -- "payments, saga_steps, estado de la orden" --> pg
+    orders -- "orders" --> pg
     flights & hotels & cars -- "reservas + inventario" --> pg
-    prefect -- "envía tareas" --> sched
+    pipe <--> prefect
+    pipe -- "envía tareas" --> sched
     sched --> w1 & w2
     w1 & w2 -- "scraping HTML" --> mock
     w1 & w2 -- "UPSERT" --> pg
@@ -106,7 +116,7 @@ flowchart TB
 **Flujo principal:**
 1. El frontend solo se comunica con el **API Gateway GraphQL** (requisito §4.2).
 2. Las búsquedas leen el catálogo desde **Supabase GraphQL (pg_graphql)**, reenviando únicamente los campos solicitados.
-3. Las reservas (`bookPackage`) se delegan al **servicio de Órdenes**, que ejecuta la **SAGA** contra Flights, Hotels y Cars.
+3. Las reservas (`bookPackage`) se delegan al **servicio de Órdenes**, que crea la orden y dispara el flow **`booking-saga` en Prefect**: el flow ejecuta la **SAGA** contra Flights, Hotels y Cars y cada paso queda visible en el panel de Prefect.
 4. En segundo plano, **Prefect** programa cada 5 minutos un flujo que reparte el scraping entre los **workers de Dask** y actualiza el catálogo en Supabase.
 
 ---
@@ -119,15 +129,18 @@ Cada microservicio es dueño exclusivo de sus tablas: ningún servicio escribe e
 |---|---|---|---|
 | **frontend** | Interfaz web: login, búsqueda, checkout, detalle con línea de tiempo SAGA | — | 3000 |
 | **gateway** | API GraphQL, autenticación, sesiones, rate limiting, autorización | `private.users` | 8080 |
-| **orders-service** | Órdenes, pagos (facturación) y **orquestación SAGA** | `orders`, `payments`, `saga_steps` | 8004* |
+| **orders-service** | Órdenes y pagos (facturación): cotiza el paquete, **dispara el flow `booking-saga` y espera su resultado**, y cierra las órdenes que quedan a medias | `orders`, `payments`, `saga_steps` | 8004* |
+| **saga-pipeline** | Sirve el deployment `booking-saga`: cada paso de la SAGA y cada compensación es una tarea de Prefect | escribe `payments`, `saga_steps` y el estado de `orders` en nombre de Órdenes | — |
 | **flights-service** | Reserva y cancelación de asientos | `flight_reservations` (+ inventario de `flights`) | 8001* |
 | **hotels-service** | Reserva y cancelación de habitaciones | `hotel_reservations` (+ inventario de `hotels`) | 8002* |
 | **cars-service** | Reserva y cancelación de autos | `car_reservations` (+ inventario de `cars`) | 8003* |
 | **pipeline** | Flujo Prefect de ingesta (corre al iniciar y cada 5 min) | `flights`, `hotels`, `cars`, `scrape_runs` | — |
 | **dask-scheduler / dask-worker ×2** | Ejecución distribuida de las tareas del flujo | — | 8787 |
-| **prefect-server** | API y panel de Prefect | — | 4200 |
+| **prefect-server** | API y panel de Prefect (ingesta y SAGA) | — | 4200 |
 | **mock-provider** | Sitio web simulado con fallos inyectados | — | 8090 |
 | **redis** | Sesiones y contadores de rate limiting | — | interno |
+
+`pipeline`, `saga-pipeline`, `prefect-server`, `dask-scheduler` y `dask-worker` usan **la misma imagen** (`wandersync/pipeline:local`), de modo que Prefect, Dask y los flows tienen versiones idénticas.
 
 \* Publicados solo en `127.0.0.1` para pruebas locales; el único punto de entrada público es el gateway.
 
@@ -285,7 +298,7 @@ sequenceDiagram
 | Tolerancia a fallos | Si una página falla tras todos los reintentos, el flujo continúa con las demás y lo registra en `scrape_runs.error` |
 | Programación | `flow.serve(interval=300)`: el flujo corre al iniciar y luego cada 5 minutos |
 | Observabilidad | Panel de Prefect (`:4200`): ejecuciones, estado de cada tarea, reintentos y logs. Panel de Dask (`:8787`): tareas por worker en tiempo real. Tabla `scrape_runs` en Supabase |
-| Una sola imagen | Prefect server, scheduler, workers y el flujo usan la misma imagen, garantizando versiones idénticas (requisito de Dask) |
+| Una sola imagen | Prefect server, scheduler, workers, el flujo de ingesta y el de la SAGA usan la misma imagen, garantizando versiones idénticas (requisito de Dask) |
 
 **Evidencia de la primera ejecución:**
 
@@ -296,6 +309,13 @@ sequenceDiagram
 | Autos | 6 | 8 | 36 |
 
 Los 135 intentos para 112 páginas muestran los **reintentos en acción**: ninguna página se perdió pese a los fallos inyectados.
+
+**Verificación final (9-oct-2026, stack reconstruido de cero):**
+
+- Cada ejecución del flujo reparte **127 tareas** (112 páginas de vuelos + 6 de hoteles + 6 de autos + 3 cargas) y termina en ~40–65 s. Todas terminan `Completed`; entre el 20 % y el 25 % de las tareas necesitó reintentos (hasta 3) y aun así terminó bien.
+- Los **2 workers de Dask** se repartieron el trabajo casi por mitad (122 y 131 tareas en la misma ventana de tiempo).
+- Datos en Supabase: las 8 rutas con vuelos, 24 habitaciones de hotel y 6 autos por ciudad, sin duplicados `(provider, external_id)`, y toda la ventana de scraping actualizada en los últimos 12 minutos.
+- Si una página se pierde tras agotar sus reintentos (≈1 de cada 112, por los fallos inyectados), la ingesta continúa y lo anota en `scrape_runs.error` (por ejemplo `1 of 112 pages failed after retries`).
 
 ---
 
@@ -337,18 +357,18 @@ Los nombres de campos se validan contra una lista blanca derivada del esquema, y
 
 ## 8. Patrón SAGA
 
-Código: [`services/orders/app/saga.py`](../services/orders/app/saga.py)
+Código: [`pipeline/flows/booking_saga.py`](../pipeline/flows/booking_saga.py) (el flow de Prefect) · [`services/orders/app/prefect_flow.py`](../services/orders/app/prefect_flow.py) (cómo Órdenes lo dispara y espera) · [`services/orders/app/saga.py`](../services/orders/app/saga.py) (cierre y recuperación de órdenes)
 
 ### 8.1 ¿Orquestación o coreografía?
 
-Se eligió **orquestación**: el servicio de Órdenes dirige los pasos y decide las compensaciones.
+Se eligió **orquestación**, y el orquestador es un **flow de Prefect** (`booking-saga`): el flow dirige los pasos y decide las compensaciones, mientras que el servicio de Órdenes solo crea la orden, dispara el flow y espera su resultado. Así cada reserva queda visible en el panel de Prefect, igual que la ingesta, y la SAGA y la ingesta comparten las mismas políticas de observabilidad.
 
 | Criterio | Orquestación (elegida) | Coreografía |
 |---|---|---|
-| Visibilidad del flujo | Todo el flujo está en un solo lugar (`saga.py`) | Repartido entre servicios que reaccionan a eventos |
-| Infraestructura | Solo HTTP | Requiere un *broker* de mensajes |
-| Auditoría | Cada paso queda en `saga_steps` | Hay que reconstruir el flujo desde eventos |
-| Demostración | La línea de tiempo se muestra directamente | Más difícil de seguir |
+| Visibilidad del flujo | Todo el flujo está en un solo lugar (`booking_saga.py`) y cada paso es una tarea visible en Prefect | Repartido entre servicios que reaccionan a eventos |
+| Infraestructura | Solo HTTP y la API de Prefect, que ya existe por la ingesta | Requiere un *broker* de mensajes |
+| Auditoría | Cada paso queda en `saga_steps` y en el historial de Prefect | Hay que reconstruir el flujo desde eventos |
+| Demostración | La línea de tiempo y el grafo de tareas se muestran directamente | Más difícil de seguir |
 
 ### 8.2 Pasos y compensaciones
 
@@ -362,6 +382,8 @@ Se eligió **orquestación**: el servicio de Órdenes dirige los pasos y decide 
 
 Si un paso falla, se compensan **en orden inverso** solo los pasos ya completados.
 
+En Prefect, cada ejecución es una tarea `execute-saga-step` y cada compensación una tarea `compensate-saga-step` (más `load-booking-order` y `capture-payment`). Cuando un paso falla, su tarea queda en rojo (`Failed`), las compensaciones en verde y el flow termina `Completed`: el fallo de negocio ya fue gestionado y la orden queda `CANCELLED`.
+
 ### 8.3 Diagrama de secuencia — camino exitoso (happy path)
 
 ```mermaid
@@ -369,7 +391,9 @@ sequenceDiagram
     autonumber
     actor U as Usuario
     participant GW as API Gateway
-    participant O as Orders (orquestador)
+    participant O as Orders
+    participant P as Prefect (API)
+    participant S as Flow booking-saga (saga-pipeline)
     participant F as Flights
     participant H as Hotels
     participant C as Cars
@@ -382,18 +406,24 @@ sequenceDiagram
     O->>H: GET /hotels/{id}
     O->>C: GET /cars/{id}
     O->>DB: INSERT orders (PENDING)
-    O->>DB: INSERT payments (AUTHORIZED)
-    Note over O,DB: saga_steps: PAYMENT EXECUTE SUCCEEDED
-    O->>F: POST /reservations
+    O->>P: crea la ejecución del deployment booking-saga
+    P-->>S: entrega la ejecución (el ejecutor consulta cada 1 s)
+    O->>P: consulta el estado cada 250 ms
+    S->>DB: lee la orden y comprueba que sigue PENDING
+    S->>DB: INSERT payments (AUTHORIZED)
+    Note over S,DB: saga_steps: PAYMENT EXECUTE SUCCEEDED
+    S->>F: POST /reservations
     F->>DB: descuenta asientos + INSERT flight_reservations
-    F-->>O: 201 CONFIRMED
-    O->>H: POST /reservations
+    F-->>S: 201 CONFIRMED
+    S->>H: POST /reservations
     H->>DB: descuenta habitaciones + INSERT hotel_reservations
-    H-->>O: 201 CONFIRMED
-    O->>C: POST /reservations
+    H-->>S: 201 CONFIRMED
+    S->>C: POST /reservations
     C->>DB: descuenta auto + INSERT car_reservations
-    C-->>O: 201 CONFIRMED
-    O->>DB: payments → CAPTURED · orders → CONFIRMED
+    C-->>S: 201 CONFIRMED
+    S->>DB: payments → CAPTURED · orders → CONFIRMED
+    S-->>P: flow Completed
+    P-->>O: estado COMPLETED
     O-->>GW: orden + sagaSteps
     GW-->>U: status CONFIRMED
 ```
@@ -405,7 +435,9 @@ sequenceDiagram
     autonumber
     actor U as Usuario
     participant GW as API Gateway
-    participant O as Orders (orquestador)
+    participant O as Orders
+    participant P as Prefect (API)
+    participant S as Flow booking-saga (saga-pipeline)
     participant F as Flights
     participant H as Hotels
     participant C as Cars
@@ -413,25 +445,30 @@ sequenceDiagram
 
     U->>GW: bookPackage(input, simulateFailure: CAR)
     GW->>O: POST /orders
-    O->>DB: orders (PENDING) · payments (AUTHORIZED)
-    O->>F: POST /reservations
-    F-->>O: 201 CONFIRMED
-    O->>H: POST /reservations
-    H-->>O: 201 CONFIRMED
-    O->>C: POST /reservations
-    C-->>O: 503 Simulated failure in cars service
-    Note over O,DB: saga_steps: CAR EXECUTE FAILED · orders → COMPENSATING
+    O->>DB: orders (PENDING)
+    O->>P: crea la ejecución de booking-saga
+    P-->>S: entrega la ejecución
+    S->>DB: payments (AUTHORIZED)
+    S->>F: POST /reservations
+    F-->>S: 201 CONFIRMED
+    S->>H: POST /reservations
+    H-->>S: 201 CONFIRMED
+    S->>C: POST /reservations
+    C-->>S: 503 Simulated failure in cars service
+    Note over S,DB: tarea execute CAR → Failed · saga_steps: CAR EXECUTE FAILED · orders → COMPENSATING
     rect rgba(255, 170, 0, 0.12)
-        Note over O: Compensación en orden inverso (cada una con hasta 3 intentos)
-        O->>H: POST /reservations/{order_id}/cancel
+        Note over S: Compensación en orden inverso (tareas compensate-saga-step, cada una con hasta 3 intentos)
+        S->>H: POST /reservations/{order_id}/cancel
         H->>DB: reserva CANCELLED + devuelve habitaciones
-        H-->>O: CANCELLED
-        O->>F: POST /reservations/{order_id}/cancel
+        H-->>S: CANCELLED
+        S->>F: POST /reservations/{order_id}/cancel
         F->>DB: reserva CANCELLED + devuelve asientos
-        F-->>O: CANCELLED
-        O->>DB: payments → REFUNDED
+        F-->>S: CANCELLED
+        S->>DB: payments → REFUNDED
     end
-    O->>DB: orders → CANCELLED
+    S->>DB: orders → CANCELLED
+    S-->>P: flow Completed (la orden quedó CANCELLED)
+    P-->>O: estado COMPLETED
     O-->>GW: orden + sagaSteps (14 eventos)
     GW-->>U: status CANCELLED, motivo del fallo
 ```
@@ -443,6 +480,8 @@ stateDiagram-v2
     [*] --> PENDING: orden creada
     PENDING --> CONFIRMED: los 4 pasos tuvieron éxito
     PENDING --> COMPENSATING: un paso falló
+    PENDING --> COMPENSATING: la ejecución en Prefect terminó mal
+    PENDING --> CANCELLED: ningún ejecutor la recogió a tiempo, se cancela la ejecución
     COMPENSATING --> CANCELLED: todas las compensaciones tuvieron éxito
     COMPENSATING --> FAILED: una compensación falló tras 3 intentos (revisión manual)
     CONFIRMED --> [*]
@@ -454,14 +493,30 @@ stateDiagram-v2
 
 | Mecanismo | Cómo funciona |
 |---|---|
-| **Compensación automática** | Sin intervención manual: el orquestador deshace los pasos completados en orden inverso |
+| **Compensación automática** | Sin intervención manual: el flow deshace los pasos completados en orden inverso |
 | **Reintento de compensaciones** | Cada compensación se intenta hasta 3 veces con espera creciente (1 s, 2 s); si aun así falla, la orden queda `FAILED` para revisión |
 | **Idempotencia de pasos** | `reserve` con un `order_id` ya confirmado devuelve la reserva existente; `cancel` sobre algo ya cancelado responde `NOTHING_TO_CANCEL`. Así los reintentos son seguros |
 | **Idempotencia del checkout** | El frontend envía un `idempotencyKey` por intento de compra; repetirlo devuelve la misma orden sin ejecutar otra SAGA |
 | **Operaciones atómicas de inventario** | `UPDATE ... SET seats_available = seats_available - n WHERE seats_available >= n` dentro de una transacción: nunca se sobrevende |
 | **Recuperación tras caídas** | Al iniciar, el servicio de Órdenes busca órdenes `PENDING`/`COMPENSATING` con más de 1 minuto y compensa los pasos iniciados y no deshechos, eliminando las **reservas huérfanas** |
 | **Auditoría** | Cada ejecución y compensación queda registrada en `saga_steps` (paso, acción, estado, error, hora) |
-| **Fallos reales** | `simulateFailure` hace que el **servicio remoto** responda `503`; el orquestador no "finge" el fallo |
+| **Fallos reales** | `simulateFailure` hace que el **servicio remoto** responda `503`; el flow no "finge" el fallo (solo el de `PAYMENT` se simula dentro del flow, porque el pago es un paso interno) |
+| **Ejecución visible en Prefect** | Cada paso y cada compensación es una tarea del flow `booking-saga`: el panel muestra el grafo, los logs y el paso que falló |
+| **Una conexión por reserva** | El flow reutiliza una sola conexión a la base, porque abrir una nueva cuesta ~1,5 s hacia Supabase: una reserva pasó de ~40 s a ~8–12 s |
+| **Sin ejecuciones tardías** | Si ningún ejecutor recoge la ejecución en 45 s, Órdenes la cancela en Prefect, cierra la orden como `CANCELLED` con el motivo y responde 503; además, el flow no ejecuta nada si la orden ya no está `PENDING` |
+| **Cierre inmediato ante fallos del flow** | Si la ejecución en Prefect termina mal, Órdenes compensa lo que alcanzó a iniciar (`saga.fail_order`) en vez de esperar a un reinicio |
+
+### 8.7 Qué pasa cuando falla el propio orquestador
+
+Como la SAGA corre en Prefect, las reservas dependen de que Prefect y el contenedor `saga-pipeline` estén vivos. Estos son los casos probados (§11):
+
+| Situación | Qué ve el usuario | Estado de la orden | Ejecución en Prefect |
+|---|---|---|---|
+| Ningún ejecutor recoge la ejecución en 45 s (`saga-pipeline` caído) | Error "The booking service failed" tras ~51 s | `CANCELLED` con el motivo; sin eventos, pagos ni reservas | `Cancelled`: no se ejecuta aunque el ejecutor vuelva |
+| La API de Prefect no responde al crear la ejecución | Error inmediato | `CANCELLED` con el motivo | no se crea |
+| La ejecución termina `FAILED` o `CRASHED` | Error 503 | `CANCELLED` tras compensar lo que se alcanzó a iniciar | `Failed` / `Crashed` |
+| La ejecución sigue corriendo pasados los 45 s | La orden se muestra `PENDING` ("Booking in progress…") | `PENDING` hasta que el flow termine | `Running` |
+| Se reinicia `orders-service` con órdenes a medias | — | `CANCELLED`: la recuperación al arrancar deshace pagos y reservas | — |
 
 ---
 
@@ -577,8 +632,10 @@ Copiar `.env.example` a `.env` y completar:
 |---|---|
 | `SUPABASE_URL` | Supabase → Project Settings → API |
 | `SUPABASE_SERVICE_KEY` | Supabase → Project Settings → API (clave `service_role` / secreta) |
-| `DATABASE_URL` | Supabase → Connect → **Session pooler** (IPv4; el plan gratuito no ofrece IPv4 en conexión directa) |
-| `REDIS_PASSWORD` | Cualquier cadena larga aleatoria |
+| `DATABASE_URL` | Supabase → Connect → **Transaction pooler**, puerto 6543 (IPv4; la conexión directa del plan gratuito no ofrece IPv4) |
+| `REDIS_PASSWORD` | Cualquier cadena larga aleatoria, solo letras y números (va dentro de una URL) |
+
+> **Por qué el Transaction pooler y no el Session pooler (puerto 5432).** El modo sesión del plan gratuito de Supabase admite solo **15 clientes simultáneos** (`EMAXCONNSESSION`). Los pools de los servicios (hasta 2 conexiones cada uno) más los procesos de los flows pueden superar ese tope, y una vez saturado puede tardar más de 20 minutos en liberarse. El modo transacción multiplexa las conexiones y aguantó 40 clientes simultáneos en las pruebas. Exige no usar sentencias preparadas, y todas las conexiones del proyecto ya las desactivan (`prepare_threshold=None`).
 
 ### 10.3 Ejecución
 
@@ -586,7 +643,7 @@ Copiar `.env.example` a `.env` y completar:
 docker compose up --build -d
 ```
 
-Se levantan **13 contenedores**:
+Se levantan **14 contenedores**:
 
 | URL | Servicio |
 |---|---|
@@ -596,7 +653,7 @@ Se levantan **13 contenedores**:
 | http://localhost:8787 | Panel de Dask |
 | http://localhost:8090 | Sitio simulado (fuente de scraping) |
 
-Todos los servicios tienen *healthchecks* y `depends_on` con `condition: service_healthy`, por lo que arrancan en el orden correcto sin intervención manual.
+Los servicios tienen *healthchecks* y `depends_on` con `condition: service_healthy`, por lo que arrancan en el orden correcto sin intervención manual. `orders-service` espera además a que `saga-pipeline` haya registrado el deployment `booking-saga` en Prefect, y la primera ingesta deja el catálogo con datos en ~1 minuto.
 
 ---
 
@@ -604,12 +661,17 @@ Todos los servicios tienen *healthchecks* y `depends_on` con `condition: service
 
 | Prueba | Cómo ejecutarla | Resultado |
 |---|---|---|
-| Ingesta Dask + Prefect | Panel de Prefect / `select * from scrape_runs` | 124 páginas por ejecución, reintentos visibles, 696 filas |
-| SAGA por consola | `docker compose exec orders-service python -m app.demo [CAR\|HOTEL\|FLIGHT\|PAYMENT]` | Camino exitoso `CONFIRMED`; fallo `CANCELLED` con compensaciones |
-| Fallo en cada paso | Igual, cambiando el paso | PAYMENT → nada que deshacer · FLIGHT → reembolso · HOTEL → vuelo + reembolso · CAR → hotel + vuelo + reembolso |
-| Consistencia | Pruebas manuales de casos límite | Checkout duplicado = 1 orden · inventario restaurado tras compensar · doble cancelación inofensiva |
+| Scraper contra el mock (sin tocar la base) | `docker compose exec -T pipeline python - < scripts/test_scraper.py` | **Todo OK**: parsea precios en 4 formatos, elimina duplicados (25 filas crudas → 24 hoteles), valida cabinas, IATA y zonas horarias, y sobrevive a los fallos inyectados (de 40 peticiones: 28 OK, 6 × 503, 5 timeouts, 1 × 429) |
+| Ingesta Dask + Prefect | Panel de Prefect / `select * from scrape_runs` | 127 tareas por ejecución (124 páginas + 3 cargas) en ~40–65 s, reintentos visibles, ~690 filas, 2 workers repartiendo el trabajo |
+| SAGA por consola | `docker compose exec orders-service python -m app.demo [CAR\|HOTEL\|FLIGHT\|PAYMENT]` | Camino exitoso `CONFIRMED`; fallo `CANCELLED` con compensaciones; cada reserva tarda ~8–12 s |
+| Fallo en cada paso | `docker compose exec -T gateway python - < scripts/test_extra.py` (T3) | PAYMENT → nada que deshacer (2 eventos) · FLIGHT → reembolso (6) · HOTEL → vuelo + reembolso (10) · CAR → hotel + vuelo + reembolso (14); ninguna reserva huérfana |
+| Consistencia e idempotencia | `scripts/test_extra.py` (T1, T2, T7) | Checkout duplicado = 1 orden y 8 eventos, también con dos envíos simultáneos · pagos y reservas coherentes con el estado de la orden · 0 reservas huérfanas |
 | Gateway de extremo a extremo | `docker compose exec -T gateway python - < scripts/test_gateway.py` | **21/21 verificaciones** (búsqueda, session fixation, Argon2id, SAGA, autorización, rate limits, alias) |
-| Auditoría de dependencias | `./scripts/security-audit.sh` | 8/8 componentes sin vulnerabilidades conocidas |
+| Bloqueo de cuenta y límites | `scripts/test_extra.py` (T4–T6) | Cuenta bloqueada tras 5 contraseñas incorrectas · 4.º registro en 10 min bloqueado · 130 consultas seguidas → HTTP 429 con `Retry-After` |
+| Ejecutor de la SAGA caído | Manual: `docker compose stop saga-pipeline` y reservar | Error a los ~51 s; la orden queda `CANCELLED` con el motivo, sin eventos ni pagos; la ejecución queda `Cancelled` en Prefect y no se ejecuta al volver el ejecutor |
+| Recuperación tras caídas | Manual: crear una orden a medias (pago, vuelo y hotel hechos) y `docker compose restart orders-service` | La orden queda `CANCELLED`, el pago `REFUNDED` y las reservas `CANCELLED` |
+| Frontend de extremo a extremo | Manual, en el navegador: crear cuenta, buscar, reservar, "Fail at car", cerrar y abrir sesión | `CONFIRMED` / `CANCELLED` con Payment, Flight y Hotel *Undone* y Car *Failed*; el frontend solo llama al gateway y la consola no muestra errores |
+| Auditoría de dependencias | `./scripts/security-audit.sh` | 8/8 componentes sin vulnerabilidades conocidas (regenerada el 9-oct-2026) |
 
 ---
 
@@ -618,14 +680,19 @@ Todos los servicios tienen *healthchecks* y `depends_on` con `condition: service
 | # | Decisión | Alternativas consideradas | Motivo |
 |---|---|---|---|
 | D1 | Python en todo el backend | Node.js para el gateway | Dask y Prefect son de Python; un solo lenguaje |
-| D2 | SAGA **orquestada** | Coreografía con eventos | Flujo visible, sin broker, auditoría directa (§8.1) |
+| D2 | SAGA **orquestada y ejecutada como flow de Prefect** | Coreografía con eventos; orquestador dentro de `orders-service` (la primera versión) | Flujo visible, sin broker, auditoría directa y cada reserva observable en Prefect, como pide el enunciado (§8.1) |
 | D3 | Supabase Cloud (plan gratuito) | Supabase autoalojado | El autoalojado requiere ~10 contenedores más; Cloud ofrece pg_graphql listo y panel para la demo |
 | D4 | Fuente de datos simulada | Scraping de Kayak/Booking reales | Permitido por el enunciado; evita bloqueos y términos de uso, y permite inyectar fallos controlados para demostrar los reintentos |
 | D5 | Gateway lee el catálogo vía pg_graphql y los usuarios vía SQL | Todo por pg_graphql | El catálogo aprovecha GraphQL nativo; los usuarios quedan fuera de GraphQL por seguridad |
 | D6 | Sesiones en servidor (Redis) | JWT en el navegador | Permite destruir y regenerar el identificador (requisito de Session Fixation) y revocar sesiones al instante |
 | D7 | Ventana deslizante en Lua | Ventana fija; librería `slowapi` | Las pruebas demostraron que la ventana fija dejaba pasar ráfagas en el cambio de minuto; `slowapi` limita por ruta y GraphQL tiene una sola ruta |
-| D8 | Una imagen para Prefect + Dask | Imágenes separadas | Dask exige versiones idénticas en cliente, scheduler y workers |
+| D8 | Una imagen para Prefect + Dask + los flows | Imágenes separadas | Dask exige versiones idénticas en cliente, scheduler y workers |
 | D9 | Pool de conexiones pequeño por servicio | Pools grandes | El *pooler* de Supabase gratuito tiene pocas conexiones |
+| D10 | *Transaction pooler* (puerto 6543) | *Session pooler* (5432) | El modo sesión del plan gratuito admite solo 15 clientes y se saturó (`EMAXCONNSESSION`); el modo transacción aguantó 40 clientes simultáneos (§10.2) |
+| D11 | Una sola conexión por ejecución del flow de la SAGA | Una conexión por sentencia | Abrir una conexión cuesta ~1,5 s hacia Supabase: una reserva pasó de ~40 s a ~8–12 s y deja de agotar el pooler |
+| D12 | El ejecutor de la SAGA consulta cada 1 s (`PREFECT_RUNNER_POLL_FREQUENCY=1`) | Valor por defecto (10 s) | Recoge la ejecución en ~1 s en lugar de hasta 10 s |
+| D13 | Cancelar la ejecución y cerrar la orden si la SAGA no arranca | Dejarla en cola | Evita que una reserva que el usuario vio fallida se ejecute al volver el ejecutor (§8.7) |
+| D14 | Fijar `sqlalchemy>=2.0,<2.1` en el pipeline | Dejar la versión libre | Con SQLAlchemy 2.1.4, el programador de Prefect 3.8.8 fallaba (`Can't evaluate bulk DML statement`) y no se creaban las ejecuciones programadas |
 
 ---
 
@@ -634,9 +701,14 @@ Todos los servicios tienen *healthchecks* y `depends_on` con `condition: service
 | Limitación | Impacto | Mejora propuesta |
 |---|---|---|
 | El scraper sobrescribe la disponibilidad (`seats_available`, etc.) cada 5 minutos | El inventario descontado por reservas se "repone" con el dato del proveedor (que se considera la fuente de verdad) | Llevar las reservas propias en una tabla aparte y restarlas de la disponibilidad del proveedor |
-| La SAGA corre dentro de la petición HTTP | Una reserva tarda unos segundos; la petición espera | Ejecutar la SAGA en segundo plano y notificar al frontend (polling o WebSocket) |
+| La petición espera el resultado de la SAGA | Una reserva tarda ~8–12 s con la interfaz mostrando "Booking…" | Responder de inmediato y notificar al frontend (polling o WebSocket) |
+| Las reservas dependen de Prefect y del contenedor `saga-pipeline` | Sin ejecutor, la reserva falla tras ~45 s (la orden queda `CANCELLED` con el motivo y no se ejecuta después, §8.7) | Varias réplicas del ejecutor y Prefect con alta disponibilidad |
+| Si la ejecución sigue corriendo pasados los 45 s, la petición devuelve la orden `PENDING` | La interfaz muestra "Booking in progress…" y la página no se actualiza sola | Consultar el estado de la orden hasta que sea final |
 | Si un `cancel` llega antes de que un `reserve` lento termine, la reserva puede quedar viva | Caso raro de carrera ante *timeouts* | Registrar una "lápida" de cancelación por `order_id` que bloquee reservas posteriores |
-| Recuperación tras caídas y bloqueo de cuenta | Implementados, sin prueba automatizada | Añadir pruebas que detengan el orquestador a mitad de una SAGA y que verifiquen el bloqueo |
+| Recuperación tras caídas y bloqueo de cuenta | Probados en la verificación final (§11), pero no hay pruebas automáticas continuas | Ejecutar `test_gateway.py` y `test_extra.py` en un pipeline de integración continua |
+| El equipo anfitrión se suspende con el stack arriba | Se cortan las conexiones a Supabase: las ejecuciones atrasadas fallan (`SSL error: unexpected eof`) y dejan filas `RUNNING` en `scrape_runs` | Evitar la suspensión durante la demostración (`caffeinate -dims`) y marcar las filas colgadas como fallidas (`scripts/cleanup_test_data.sql`) |
+| Cuando una página se pierde tras sus reintentos aparece un `CRITICAL ... Failed to deserialize` en los logs del pipeline | Cosmético: la ingesta termina `SUCCEEDED` y la página queda anotada en `scrape_runs.error` | Convertir `HTTPStatusError` en una excepción serializable por Dask |
+| Dos stacks contra el mismo proyecto de Supabase | Duplican la ingesta y comparten el límite de conexiones del pooler | Usar un solo stack a la vez, o un proyecto de Supabase por integrante |
 | Supabase gratuito pausa el proyecto tras ~7 días sin uso | La primera petición tras la pausa falla | Abrir el panel de Supabase antes de la demostración |
 | HTTP local sin TLS | `COOKIE_SECURE=false` | En producción, servir por HTTPS y activar `COOKIE_SECURE=true` |
 
@@ -644,13 +716,19 @@ Todos los servicios tienen *healthchecks* y `depends_on` con `condition: service
 
 ## 14. Guía de la demostración
 
-Antes de grabar: `docker compose up -d` y esperar que todos los contenedores estén *healthy* (`docker compose ps`).
+**Antes de grabar:**
+
+1. `docker compose up -d` y esperar a que todos los contenedores estén *healthy* (`docker compose ps`; son 14, y 3 de ellos no tienen *healthcheck*). La primera ingesta deja el catálogo con datos en ~1 minuto.
+2. Evitar que el equipo se suspenda mientras el stack está arriba (`caffeinate -dims` en una terminal): al suspenderse se cortan las conexiones a Supabase y las ejecuciones atrasadas quedan `Failed` en el historial de Prefect.
+3. Usar un solo stack contra el proyecto de Supabase (no tener otro levantado en otro equipo).
+4. Buscar **Bogotá → Cartagena** con una fecha entre mañana y +13 días (son las rutas y fechas que scrapea el flujo). No crear más de 3 cuentas en 10 minutos desde la misma IP: el 4.º registro se bloquea por *rate limit*. Si hace falta repetir la toma, `docker compose exec -T redis redis-cli FLUSHALL` reinicia los contadores (y cierra todas las sesiones).
+5. Opcional, para un historial de Prefect sin ejecuciones fallidas de pruebas anteriores: `docker compose down -v` y luego `docker compose up -d`.
 
 | Parte | Qué mostrar | Dónde |
 |---|---|---|
-| **(a)** Prefect monitoreando flujos | Deployment `scheduled-ingestion`, una ejecución completada, tareas con **reintentos** (estado *AwaitingRetry*) y sus logs. Lanzar una ejecución con **Quick run** | http://localhost:4200 |
+| **(a)** Prefect monitoreando flujos | Los dos deployments: `scheduled-ingestion` (ingesta) y `booking-saga` (SAGA). En la ingesta: una ejecución completada, tareas con **reintentos** (estado *AwaitingRetry*) y sus logs; lanzar otra con **Quick run**. En `booking-saga`: la ejecución de cada reserva con su grafo de tareas | http://localhost:4200 |
 | **(b)** Tareas distribuidas en Dask | Durante esa ejecución: barras de tareas repartidas entre los 2 workers (*Status* y *Workers*) | http://localhost:8787 |
-| **(c)** Frontend consumiendo GraphQL | Crear cuenta, buscar Bogotá → Cartagena, elegir vuelo + hotel + auto, reservar → orden `CONFIRMED`. Opcional: pestaña *Network* del navegador mostrando las peticiones a `/graphql` | http://localhost:3000 |
-| **(d)** Fallo transaccional con compensación SAGA | Reservar de nuevo con **"Demo: simulate a failure" → Fail at car**: Payment, Flight y Hotel aparecen como *Undone*, Car como *Failed*, y el registro de eventos muestra las compensaciones en orden inverso. Mostrar también `saga_steps` en Supabase | Frontend + Supabase |
+| **(c)** Frontend consumiendo GraphQL | Crear cuenta, buscar Bogotá → Cartagena, elegir vuelo + hotel + auto, reservar (la interfaz muestra "Booking…" unos ~8–12 s) → orden `CONFIRMED`. Opcional: pestaña *Network* del navegador mostrando que todas las peticiones van a `/graphql` | http://localhost:3000 |
+| **(d)** Fallo transaccional con compensación SAGA | Reservar de nuevo con **"Demo: simulate a failure" → Fail at car**: Payment, Flight y Hotel aparecen como *Undone*, Car como *Failed*, y el registro de eventos muestra las compensaciones en orden inverso. Abrir en Prefect la ejecución `booking-<id>` de esa orden: `execute CAR` en rojo y las tres tareas `compensate` en verde. Mostrar también `saga_steps` en Supabase | Frontend + Prefect + Supabase |
 
-Puntos extra para la sustentación: mostrar en el navegador (*DevTools → Application → Cookies*) que el valor de `wsid` **cambia** al hacer login (Session Fixation), y ejecutar `./scripts/security-audit.sh` o abrir `docs/security/README.md`.
+Puntos extra para la sustentación: mostrar en el navegador (*DevTools → Application → Cookies*) que el valor de `wsid` **cambia** al hacer login (Session Fixation), y ejecutar `./scripts/security-audit.sh` o abrir `docs/security/README.md`. Para evidenciar las pruebas: `scripts/test_gateway.py` (21 verificaciones), `scripts/test_extra.py` (22) y `scripts/test_scraper.py` (§11).

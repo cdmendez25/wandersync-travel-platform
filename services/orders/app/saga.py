@@ -191,6 +191,33 @@ def run_saga(pool, order: dict, fail_at: str | None = None) -> str:
     return "CONFIRMED"
 
 
+def _undo_started_steps(pool, order: dict, reason: str) -> str:
+    """Undo every step that started and was not yet compensated, then close the order
+    (CANCELLED, or FAILED if an undo never succeeded). Returns the final status."""
+    with pool.connection() as conn:
+        rows = conn.execute(
+            "select step, action, status from public.saga_steps where order_id = %s", (order["id"],)
+        ).fetchall()
+    started = {r["step"] for r in rows if r["action"] == "EXECUTE"}
+    undone = {r["step"] for r in rows if r["action"] == "COMPENSATE" and r["status"] == "SUCCEEDED"}
+    pending = [s for s in reversed(STEPS) if s in started and s not in undone]
+    logger.warning("Settling order %s (%s), compensating %s", order["id"], reason, pending)
+    _set_status(pool, order["id"], "COMPENSATING", reason)
+    final = "CANCELLED" if _compensate(pool, order, pending) else "FAILED"
+    _set_status(pool, order["id"], final)
+    return final
+
+
+def fail_order(pool, order_id, reason: str) -> str | None:
+    """Settle an order whose Prefect SAGA run is known to have stopped (it never started, crashed
+    or failed): undo whatever it started so nothing stays reserved. Returns the final status."""
+    with pool.connection() as conn:
+        order = conn.execute("select * from public.orders where id = %s", (order_id,)).fetchone()
+    if order is None or order["status"] not in ("PENDING", "COMPENSATING"):
+        return order["status"] if order else None
+    return _undo_started_steps(pool, order, reason)
+
+
 def recover_stuck_orders(pool) -> None:
     """On startup, finish orders left half-done by a crash (the "orphan bookings"
     problem): every step that started and was not yet compensated is undone."""
@@ -200,14 +227,4 @@ def recover_stuck_orders(pool) -> None:
             "and updated_at < now() - interval '1 minute'"
         ).fetchall()
     for order in stuck:
-        with pool.connection() as conn:
-            rows = conn.execute(
-                "select step, action, status from public.saga_steps where order_id = %s", (order["id"],)
-            ).fetchall()
-        started = {r["step"] for r in rows if r["action"] == "EXECUTE"}
-        undone = {r["step"] for r in rows if r["action"] == "COMPENSATE" and r["status"] == "SUCCEEDED"}
-        pending = [s for s in reversed(STEPS) if s in started and s not in undone]
-        logger.warning("Recovering order %s, compensating %s", order["id"], pending)
-        _set_status(pool, order["id"], "COMPENSATING", "Recovered after orchestrator restart")
-        final = "CANCELLED" if _compensate(pool, order, pending) else "FAILED"
-        _set_status(pool, order["id"], final)
+        _undo_started_steps(pool, order, "Recovered after orchestrator restart")

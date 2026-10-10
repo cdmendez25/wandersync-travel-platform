@@ -6,6 +6,7 @@ table.
 """
 import os
 import time
+from contextlib import contextmanager
 from uuid import UUID, uuid4
 
 import httpx
@@ -28,14 +29,36 @@ class StepError(Exception):
     """A SAGA action that requires compensation has failed."""
 
 
-def _connect() -> psycopg.Connection:
-    return psycopg.connect(
-        DATABASE_URL,
-        prepare_threshold=None,
-        sslmode="require",
-        row_factory=dict_row,
-        connect_timeout=10,
-    )
+# Prefect's runner cloudpickles this module's globals to start each flow run in a subprocess,
+# so they must stay picklable (no locks here); psycopg already serializes access to a connection.
+_conn: psycopg.Connection | None = None
+
+
+@contextmanager
+def _connect():
+    """Yield the one connection shared by the whole flow run (statements run in autocommit).
+
+    Opening a connection costs ~1.5 s against Supabase (TLS + auth through the pooler), so
+    one per statement made a booking take ~40 s and could exhaust the pooler's client limit.
+    """
+    global _conn
+    if _conn is None or _conn.closed or _conn.broken:
+        _conn = psycopg.connect(
+            DATABASE_URL,
+            prepare_threshold=None,
+            sslmode="require",
+            row_factory=dict_row,
+            connect_timeout=10,
+            autocommit=True,
+        )
+    yield _conn
+
+
+def _close_connection() -> None:
+    global _conn
+    if _conn is not None and not _conn.closed:
+        _conn.close()
+    _conn = None
 
 
 def _call_service(method: str, url: str, payload: dict | None = None) -> dict:
@@ -221,11 +244,22 @@ def capture_payment(order_id: str) -> None:
 @flow(name="booking-saga", flow_run_name="booking-{order_id}", log_prints=True)
 def booking_saga(order_id: str, fail_at: str | None = None) -> str:
     """Execute a booking SAGA and expose every action in Prefect."""
+    try:
+        return _run_saga(order_id, fail_at)
+    finally:
+        _close_connection()
+
+
+def _run_saga(order_id: str, fail_at: str | None) -> str:
     UUID(order_id)  # fail early with a clear invalid-parameter error
     if fail_at is not None and fail_at not in STEPS:
         raise ValueError(f"Unknown SAGA step {fail_at!r}")
 
     order = load_order(order_id)
+    if order["status"] != "PENDING":
+        # The orders service already settled it (for example after its timeout): never book it late
+        get_run_logger().warning("order=%s is %s, not PENDING: nothing to execute", order_id, order["status"])
+        return order["status"]
     completed: list[str] = []
     for step in STEPS:
         try:

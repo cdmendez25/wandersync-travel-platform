@@ -14,6 +14,7 @@ from app import prefect_flow, saga
 from common.db import create_pool
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("orders")
 
 pool = None
 
@@ -114,6 +115,12 @@ def create_order(req: CreateOrderRequest):
     try:
         prefect_flow.run_booking_saga(str(order["id"]), req.simulate_failure)
     except prefect_flow.SagaFlowError as exc:
+        if not exc.stopped:
+            # The run may still finish: report the order as it is (PENDING) instead of an error
+            # that a late completion would contradict.
+            logger.warning("Order %s: %s; leaving it to the SAGA run", order["id"], exc)
+            return _order_view(order["id"])
+        saga.fail_order(pool, order["id"], f"Booking could not be completed: {exc}")
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return _order_view(order["id"])
 
