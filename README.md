@@ -4,6 +4,8 @@ Plataforma de empaquetamiento turístico dinámico (vuelo + hotel + auto) constr
 
 Parcial Práctico del Segundo Corte — Patrones Arquitectónicos Avanzados.
 
+**Integrantes:** Carlos Andres Diaz Mendez · Maria Jose Palomino Carreño
+
 📄 **Documento técnico de arquitectura:** [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md)
 🔒 **Auditoría de dependencias:** [`docs/security/README.md`](docs/security/README.md)
 

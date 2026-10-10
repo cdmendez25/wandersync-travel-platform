@@ -3,6 +3,8 @@
 **Asignatura:** Patrones Arquitectónicos Avanzados · **Evaluación:** Parcial Práctico del Segundo Corte
 **Proyecto:** Plataforma de Empaquetamiento Turístico Dinámico
 
+**Integrantes:** Carlos Andres Diaz Mendez · Maria Jose Palomino Carreño
+
 ---
 
 ## Tabla de contenido
