@@ -161,6 +161,7 @@ services:
     environment:
       PREFECT_HOME: /data/prefect
       PREFECT_UI_API_URL: http://localhost:4200/api
+      PREFECT_UI_STATIC_DIRECTORY: /data/prefect/ui  # writable place for the UI bundle (the container runs as non-root)
       PREFECT_SERVER_ANALYTICS_ENABLED: "false"
     volumes:
       - prefect-data:/data/prefect

@@ -4,3 +4,5 @@ dask[distributed,diagnostics]>=2025.1
 httpx>=0.27,<1
 beautifulsoup4>=4.12,<5
 psycopg[binary]>=3.2,<4
+# Prefect 3.8.8's scheduler fails with SQLAlchemy 2.1.4 ("bulk DML" error); stay on 2.0.x until Prefect supports 2.1
+sqlalchemy>=2.0,<2.1
